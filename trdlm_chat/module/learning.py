@@ -13,6 +13,7 @@ class TrdlmLearningParams:
     total_batch_size: int = 65536
     epochs: int = 1
     beta_ema: float = 0.99
+    target_param_data_ratio = 20
 
     # AdamW parameters
     adamw_embedding_lr: float = 0.2

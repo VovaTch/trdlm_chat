@@ -1,8 +1,11 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+import math
 
 import torch
 import torch.nn as nn
+
+from trdlm_chat.utils.other import get_token_bytes
 
 
 class LossComponent(ABC):
@@ -268,3 +271,46 @@ class MaskedPercentCorrect(LossComponent):
         pred_logits_argmax = torch.argmax(logits, dim=1)  # type: ignore
         correct = torch.sum(pred_logits_argmax == target[self.ref_key][mask])
         return correct / torch.numel(pred_logits_argmax)
+
+
+@dataclass
+class MaskedBitsPerByte(LossComponent):
+    name: str
+    weight: float
+    pred_key: str
+    mask_key: str
+    ref_key: str
+    tokenizer_path: str
+    differentiable: bool = False
+    base_loss: nn.Module | None = None
+
+    def __call__(
+        self, pred: dict[str, torch.Tensor], target: dict[str, torch.Tensor]
+    ) -> torch.Tensor:
+        """
+        Call method for outputting the loss
+
+        Args:
+            pred (dict[str, torch.Tensor]): Network estimation
+            target (dict[str, torch.Tensor]): Ground truth reference
+
+        Returns:
+            torch.Tensor: loss
+        """
+        mask = ~target[self.mask_key]
+        if pred[self.pred_key].dim() == 4:
+            logits = pred[self.pred_key][mask].permute(0, 2, 1)
+        elif pred[self.pred_key].dim() == 3:
+            logits = pred[self.pred_key][mask]
+        labels = target[self.ref_key][mask]
+        if self.base_loss is None:
+            self.base_loss = nn.CrossEntropyLoss(reduction="none")
+        base_loss = self.base_loss(logits, labels)  # type: ignore
+        base_loss = base_loss.view(-1)
+        token_bytes = get_token_bytes(self.tokenizer_path)
+        num_bytes_2d = token_bytes[labels]
+        total_nats = (base_loss * (num_bytes_2d > 0)).sum()
+        total_bytes = num_bytes_2d.sum()
+        if total_bytes == 0:
+            return torch.tensor(torch.inf)
+        return total_nats / (math.log(2) * total_bytes)

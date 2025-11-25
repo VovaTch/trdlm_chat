@@ -1,8 +1,10 @@
 import logging
+import time
 from enum import StrEnum
 from typing import Any
 
 import lightning as L
+from lightning.pytorch.core.optimizer import LightningOptimizer
 import torch
 from lightning.pytorch.utilities.types import STEP_OUTPUT, OptimizerLRScheduler
 
@@ -32,6 +34,7 @@ class TRDLM(L.LightningModule):
         self._learning_params = learning_params
         self._loss_aggregator = loss_aggregator
         self._logger = logger
+        self._current_training_step = 0
 
         # Lightning-specific setup
         self.automatic_optimization = False
@@ -96,6 +99,8 @@ class TRDLM(L.LightningModule):
         return [adamw_optimizer, muon_optimizer]
 
     def step(self, batch: dict[str, Any], phase: _Phase) -> None:
+
+        time_s = time.time()
 
         if phase == _Phase.TRAINING and self._loss_aggregator is None:
             raise RuntimeError("Must have a loss aggregator object for training")
@@ -187,22 +192,66 @@ class TRDLM(L.LightningModule):
             if torch.all(sup_step_output["stop"] > 0):
                 break
 
+        token_per_sec = (
+            self._learning_params.device_batch_size
+            * self._learning_params.supervision_steps
+            / (time.time() - time_s)
+        )
+        self.log(f"{phase}\\tokens_per_sec", token_per_sec, sync_dist=True)
         self.log_loss(total_loss_output, phase)
 
     def training_step(self, batch: dict[str, Any], batch_idx: int) -> STEP_OUTPUT:
+        lr_multiplier = self.get_lr_multiplier(self._current_training_step)
+        self.apply_lr_multiplier(lr_multiplier=lr_multiplier)
         self.step(batch, _Phase.TRAINING)
+        self._current_training_step += 1
+
+    def validation_step(self, batch: dict[str, Any], batch_idx: int) -> STEP_OUTPUT:
+        self.step(batch, _Phase.VALIDATION)
 
     def get_lr_multiplier(self, it: int) -> float:
-        warmup_iters = round(
-            self._learning_params.warmup_ratio * self._learning_params.num_iterations
+        """
+        Psuedo learn rate scheduling as presented in Nanochat
+
+        Args:
+            it (int): Current iteration
+
+        return:
+            float: current learning rate multiplier
+        """
+
+        warmup_iters = round(self._learning_params.warmup_ratio * self.num_iterations)
+        warmdown_iters = round(
+            self._learning_params.warmdown_ratio * self.num_iterations
         )
-        warmdown_iters = round(self._learning_params.warmdown_ratio * num_iterations)
         if it < warmup_iters:
             return (it + 1) / warmup_iters
-        elif it <= num_iterations - warmdown_iters:
+        elif it <= self.num_iterations - warmdown_iters:
             return 1.0
         else:
-            progress = (num_iterations - it) / warmdown_iters
+            progress = (self.num_iterations - it) / warmdown_iters
             return (
                 progress * 1.0 + (1 - progress) * self._learning_params.final_lr_ratio
             )
+
+    def apply_lr_multiplier(self, lr_multiplier: float) -> None:
+        optimizers = self.optimizers()
+        assert not isinstance(optimizers, LightningOptimizer), "Shouldn't be here"
+        for opt in optimizers:
+            for group in opt.param_groups:
+                group["lr"] = group["initial_lr"] * lr_multiplier
+
+    @property
+    def num_params(self) -> int:
+        """
+        Returns the number of parameters of the models in the module
+        """
+        return sum(p.numel() for p in self.parameters())
+
+    @property
+    def num_iterations(self) -> int:
+        """
+        Returns the number of learning tokens based on Chinchila scalling laws
+        """
+        target_tokens = self._learning_params.target_param_data_ratio * self.num_params
+        return target_tokens // self._learning_params.total_batch_size
