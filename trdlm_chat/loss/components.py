@@ -275,6 +275,10 @@ class MaskedPercentCorrect(LossComponent):
 
 @dataclass
 class MaskedBitsPerByte(LossComponent):
+    """
+    BPB computation for LLM evaluation. By default it is not differentiable, because it is strictly meant for eval.
+    """
+
     name: str
     weight: float
     pred_key: str
